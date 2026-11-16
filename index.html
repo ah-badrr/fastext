@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TextRoom</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Halaman awal -->
+  <main id="home" class="card">
+    <h1>TextRoom</h1>
+    <p class="sub">Kirim teks antar perangkat lewat room. Tanpa login, tanpa WA.</p>
+
+    <label for="nameInput">Nama perangkat (opsional)</label>
+    <input id="nameInput" type="text" maxlength="20" placeholder="contoh: HP, Laptop, PC Lab" autocomplete="off">
+
+    <button id="newBtn" class="primary">Buat room baru</button>
+
+    <div class="divider"><span>atau masuk ke room</span></div>
+
+    <form id="joinForm" class="row">
+      <input id="codeInput" type="text" placeholder="kode room" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <button type="submit">Masuk</button>
+    </form>
+
+    <p class="hint">Pesan dienkripsi di browser (AES-GCM) dengan kode room sebagai kuncinya. Makin acak kodenya, makin aman. Pesan tersimpan sementara di server relay (±12 jam).</p>
+  </main>
+
+  <!-- Halaman room -->
+  <main id="room" class="chat hidden">
+    <header>
+      <div class="title">
+        <span id="statusDot" class="dot"></span>
+        <strong id="roomCode"></strong>
+      </div>
+      <div class="actions">
+        <button id="copyLink" title="Salin link room">Salin link</button>
+        <button id="leaveBtn" title="Keluar dari room">Keluar</button>
+      </div>
+    </header>
+
+    <div id="messages" class="messages"></div>
+
+    <form id="sendForm" class="composer">
+      <textarea id="textInput" rows="1" placeholder="Ketik teks... (Enter kirim, Shift+Enter baris baru)"></textarea>
+      <button id="sendBtn" class="primary" type="submit">Kirim</button>
+    </form>
+  </main>
+
+  <div id="toast" class="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>
