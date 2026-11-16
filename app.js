@@ -1,7 +1,9 @@
 (() => {
   // Relay publik gratis berbasis pub/sub HTTP. Bisa diganti dengan server ntfy sendiri.
   const SERVER = 'https://ntfy.sh';
-  const MAX_BODY = 3800; // batas ntfy 4096 byte
+  const MAX_BODY = 3800; // batas ntfy 4096 byte (payload base64 per potongan)
+  const CHUNK_TTL = 60000; // gabungkan potongan selama maks 60 detik
+  const MAX_CHARS = 50000; // batas praktis teks per pesan (±20potongan x 2500 karakter)
 
   const $ = (s) => document.querySelector(s);
   const home = $('#home'), room = $('#room');
@@ -10,7 +12,99 @@
   const statusDot = $('#statusDot');
 
   const enc = new TextEncoder(), dec = new TextDecoder();
-  let state = { code: null, topic: null, key: null, es: null, seen: new Set() };
+  let state = { code: null, topic: null, key: null, es: null, seen: new Set(), pending: new Map() };
+
+  // ---------- pemotongan pesan panjang ----------
+  // Batas ntfy ±4096 byte per request, dan ciphertext AES-GCM tidak bisa
+  // dipotong-potong sembarangan. Jadi teks dipecah DULU (per karakter), tiap
+  // potongan dienkripsi & dikirim sebagai satu POST terpisah, lalu penerima
+  // menggabungkannya kembali menjadi satu pesan utuh.
+
+  // Estimasi panjang payload base64 (iv+ciphertext+tag) untuk JSON sepanjang n byte.
+  const b64LenForBytes = (n) => Math.ceil((12 + n + 16) / 3) * 4;
+  const bytesOf = (s) => enc.encode(s).length;
+
+  // Cari ukuran potongan terbesar (<= hi) yang payload-nya masih < MAX_BODY,
+  // termasuk overhead JSON pembungkusnya ({text, from, cid, mid, part, total}).
+  function fitChunkSize(text, metaBytes, lo, hi) {
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (b64LenForBytes(bytesOf(text.slice(0, mid)) + metaBytes) < MAX_BODY) lo = mid;
+      else hi = mid - 1;
+    }
+    return Math.max(lo, 1);
+  }
+
+  function splitText(text, metaBytes) {
+    const parts = [];
+    let rest = text;
+    while (bytesOf(rest) + metaBytes >= MAX_BODY) {
+      const size = fitChunkSize(rest, metaBytes, 1, rest.length);
+      // jangan potong pasangan surrogate (emoji/karakter Unicode di atas U+FFFF)
+      const last = rest.charCodeAt(size - 1);
+      const cut = (last >= 0xd800 && last <= 0xdbff) ? size - 1 : size;
+      parts.push(rest.slice(0, cut));
+      rest = rest.slice(cut);
+    }
+    if (rest) parts.push(rest);
+    return parts;
+  }
+
+  async function sendMessageChunks(parts, from, msgId, total) {
+    for (let i = 0; i < parts.length; i++) {
+      const body = await encrypt({
+        text: parts[i], from, cid: clientId,
+        ...(total > 1 ? { mid: msgId, part: i, total } : {})
+      });
+      if (body.length > MAX_BODY) throw new Error('chunk terlalu besar');
+      const res = await fetch(`${SERVER}/${state.topic}`, { method: 'POST', body });
+      if (!res.ok) throw new Error(res.status);
+    }
+  }
+
+  // Hitung potongan dengan asumsi JSON pembungkus paling buruk (paling panjang),
+  // lalu verifikasi payload asli tiap potongan — perkecil & ulangi jika kebesaran.
+  async function buildParts(text, from) {
+    let metaBytes = 256 + clientId.length + from.length;
+    for (;;) {
+      const parts = splitText(text, metaBytes);
+      const msgId = crypto.randomUUID();
+      // total bisa bertambah saat potongan dikecilkan -> pakai angka terburuk: 999
+      const worstTotal = String(Math.max(parts.length, 999));
+      try {
+        for (const p of parts) {
+          const body = await encrypt({
+            text: p, from, cid: clientId,
+            ...(parts.length > 1 ? { mid: msgId, part: 999, total: worstTotal } : {})
+          });
+          if (body.length > MAX_BODY) throw new Error('over');
+        }
+        return parts;
+      } catch (_) {
+        if (metaBytes <= 64) throw new Error('split gagal');
+        metaBytes *= 2; // conservative: perkecil ukuran potongan
+      }
+    }
+  }
+
+  // Kumpulkan potongan-potongan dari satu pesan panjang, gabung saat lengkap.
+  function collectPart(p, unixTime) {
+    const { mid, part, total } = p;
+    let buf = state.pending.get(mid);
+    if (!buf) {
+      buf = new Array(total);
+      state.pending.set(mid, buf);
+      setTimeout(() => {
+        if (state.pending.get(mid) === buf) state.pending.delete(mid);
+      }, CHUNK_TTL);
+    }
+    if (part >= total) return; // data rusak
+    buf[part] = p.text;
+    if (buf.every((x) => x !== undefined)) {
+      state.pending.delete(mid);
+      addMessage({ text: buf.join(''), from: p.from, cid: p.cid }, unixTime);
+    }
+  }
 
   // ---------- util ----------
   const clientId = (() => {
@@ -83,7 +177,7 @@
     leaveRoom(true);
 
     const { topic, key } = await deriveKeys(code);
-    state = { code, topic, key, es: null, seen: new Set() };
+    state = { code, topic, key, es: null, seen: new Set(), pending: new Map() };
 
     $('#roomCode').textContent = code;
     messagesEl.innerHTML = '<div class="empty">Belum ada pesan. Kirim yang pertama!</div>';
@@ -106,14 +200,18 @@
         if (m.event !== 'message' || state.seen.has(m.id)) return;
         state.seen.add(m.id);
         const payload = await decrypt(m.message);
-        addMessage(payload, m.time);
+        if (typeof payload.mid === 'string' && Number.isInteger(payload.part)) {
+          collectPart(payload, m.time); // bagian dari pesan panjang -> tunggu lengkap
+        } else {
+          addMessage(payload, m.time);
+        }
       } catch (_) { /* bukan pesan valid / kunci salah -> abaikan */ }
     };
   }
 
   function leaveRoom(silent) {
     if (state.es) state.es.close();
-    state = { code: null, topic: null, key: null, es: null, seen: new Set() };
+    state = { code: null, topic: null, key: null, es: null, seen: new Set(), pending: new Map() };
     if (!silent) {
       room.classList.add('hidden');
       home.classList.remove('hidden');
@@ -163,24 +261,52 @@
   }
 
   // ---------- kirim ----------
+  let sending = false;
   async function send() {
     const text = textInput.value.trim();
-    if (!text || !state.topic) return;
-    const body = await encrypt({ text, from: nameInput.value.trim() || 'Anonim', cid: clientId });
-    if (body.length > MAX_BODY) { toast('Teks terlalu panjang (maks ± 2.500 karakter)'); return; }
+    if (!text || !state.topic || sending) return;
+    if (text.length > MAX_CHARS) {
+      toast(`Teks terlalu panjang (maks ${MAX_CHARS.toLocaleString('id-ID')} karakter)`);
+      return;
+    }
+    const from = nameInput.value.trim() || 'Anonim';
+    sending = true;
+    $('#sendBtn').disabled = true;
     try {
-      const res = await fetch(`${SERVER}/${state.topic}`, { method: 'POST', body });
-      if (!res.ok) throw new Error(res.status);
+      const parts = await buildParts(text, from);
+      if (parts.length === 1) {
+        // pesan pendek: kirim sekali saja tanpa metadata chunk (hemat kuota)
+        const body = await encrypt({ text, from, cid: clientId });
+        const res = await fetch(`${SERVER}/${state.topic}`, { method: 'POST', body });
+        if (!res.ok) throw new Error(res.status);
+      } else {
+        await sendMessageChunks(parts, from, crypto.randomUUID(), parts.length);
+      }
       textInput.value = '';
       autosize();
+      updateCounter();
+      if (parts.length > 1) toast(`Terkirim dalam ${parts.length} potongan`);
     } catch (e) {
       toast('Gagal kirim, cek koneksi');
+    } finally {
+      sending = false;
+      $('#sendBtn').disabled = false;
     }
   }
 
   function autosize() {
     textInput.style.height = 'auto';
     textInput.style.height = Math.min(textInput.scrollHeight, 140) + 'px';
+  }
+
+  // penghitung karakter realtime (muncul saat mendekati batas)
+  const counterEl = $('#charCount');
+  function updateCounter() {
+    const n = textInput.value.trim().length;
+    if (n < MAX_CHARS * 0.8) { counterEl.textContent = ''; return; }
+    const k = (v) => v.toLocaleString('id-ID');
+    counterEl.textContent = `${k(n)} / ${k(MAX_CHARS)} karakter`;
+    counterEl.classList.toggle('warn', n > MAX_CHARS);
   }
 
   // ---------- event ----------
@@ -192,7 +318,7 @@
     navigator.clipboard.writeText(url).then(() => toast('Link room tersalin'));
   };
   $('#sendForm').onsubmit = (e) => { e.preventDefault(); send(); };
-  textInput.addEventListener('input', autosize);
+  textInput.addEventListener('input', () => { autosize(); updateCounter(); });
   textInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
   });
