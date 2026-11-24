@@ -1,7 +1,11 @@
 (() => {
   // Relay publik gratis berbasis pub/sub HTTP. Bisa diganti dengan server ntfy sendiri.
   const SERVER = 'https://ntfy.sh';
-  const MAX_BODY = 3800; // batas ntfy 4096 byte
+  const MAX_BODY = 3800; // batas ntfy 4096 byte (payload base64 per potongan)
+  const CHUNK_TTL = 120000; // gabungkan potongan selama maks 120 detik
+  // Batas bawah untuk penghitung karakter di UI. Batas ATAS sebenarnya tidak
+  // tetap: sepanjang potongan masih bisa terkirim & tergabung, kirim terus.
+  const SOFT_WARN_CHARS = 2000;
 
   const $ = (s) => document.querySelector(s);
   const home = $('#home'), room = $('#room');
@@ -10,7 +14,150 @@
   const statusDot = $('#statusDot');
 
   const enc = new TextEncoder(), dec = new TextDecoder();
-  let state = { code: null, topic: null, key: null, es: null, seen: new Set() };
+  let state = { code: null, topic: null, key: null, es: null, seen: new Set(), pending: new Map() };
+
+  // ---------- pemotongan pesan panjang ----------
+  // Batas ntfy ±4096 byte per request, dan ciphertext AES-GCM tidak bisa
+  // dipotong-potong sembarangan. Jadi teks dipecah DULU (per karakter), tiap
+  // potongan dienkripsi & dikirim sebagai satu POST terpisah, lalu penerima
+  // menggabungkannya kembali menjadi satu pesan utuh.
+
+  // Estimasi panjang payload base64 (iv+ciphertext+tag) untuk JSON sepanjang n byte.
+  const b64LenForBytes = (n) => Math.ceil((12 + n + 16) / 3) * 4;
+  const bytesOf = (s) => enc.encode(s).length;
+
+  // Cari ukuran potongan terbesar (<= hi) yang payload-nya masih < MAX_BODY,
+  // termasuk overhead JSON pembungkusnya ({text, from, cid, mid, part, total}).
+  function fitChunkSize(text, metaBytes, lo, hi) {
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (b64LenForBytes(bytesOf(text.slice(0, mid)) + metaBytes) < MAX_BODY) lo = mid;
+      else hi = mid - 1;
+    }
+    return Math.max(lo, 1);
+  }
+
+  function splitText(text, metaBytes) {
+    const parts = [];
+    let rest = text;
+    while (bytesOf(rest) + metaBytes >= MAX_BODY) {
+      const size = fitChunkSize(rest, metaBytes, 1, rest.length);
+      // jangan potong pasangan surrogate (emoji/karakter Unicode di atas U+FFFF)
+      const last = rest.charCodeAt(size - 1);
+      const cut = (last >= 0xd800 && last <= 0xdbff) ? size - 1 : size;
+      parts.push(rest.slice(0, cut));
+      rest = rest.slice(cut);
+    }
+    if (rest) parts.push(rest);
+    return parts;
+  }
+
+  // Kirim satu potongan. Return true = terkirim; false = server menolak karena
+  // payload kebesaran (panggilan harus memotong ulang teks & mengirim ulang).
+  async function postChunk(body) {
+    const res = await fetch(`${SERVER}/${state.topic}`, { method: 'POST', body });
+    if (res.ok) return true;
+    if (res.status === 400 || res.status === 413) return false;
+    throw new Error(res.status); // error jaringan/server lain -> bukan soal ukuran
+  }
+
+  async function sendMessageChunks(parts, from, msgId, total) {
+    for (let i = 0; i < parts.length; i++) {
+      const body = await encrypt({
+        text: parts[i], from, cid: clientId,
+        ...(total > 1 ? { mid: msgId, part: i, total } : {})
+      });
+      if (body.length > MAX_BODY) throw new Error('chunk terlalu besar');
+      const ok = await postChunk(body);
+      if (!ok) throw new Error('over');
+    }
+  }
+
+  // Hitung potongan dengan asumsi JSON pembungkus paling buruk (paling panjang),
+  // lalu verifikasi payload asli tiap potongan — perkecil & ulangi jika kebesaran.
+  async function buildParts(text, from, metaBytes) {
+    if (metaBytes === undefined) metaBytes = 256 + clientId.length + from.length;
+    for (;;) {
+      const parts = splitText(text, metaBytes);
+      const msgId = crypto.randomUUID();
+      // total bisa bertambah saat potongan dikecilkan -> pakai angka terburuk: 999
+      const worstTotal = String(Math.max(parts.length, 999));
+      try {
+        for (const p of parts) {
+          const body = await encrypt({
+            text: p, from, cid: clientId,
+            ...(parts.length > 1 ? { mid: msgId, part: 999, total: worstTotal } : {})
+          });
+          if (body.length > MAX_BODY) throw new Error('over');
+        }
+        return parts;
+      } catch (_) {
+        if (metaBytes <= 64) throw new Error('split gagal');
+        metaBytes *= 2; // conservative: perkecil ukuran potongan
+      }
+    }
+  }
+
+  // Kumpulkan potongan-potongan dari satu pesan panjang, gabung saat lengkap.
+  // Jika terdeteksi ada bagian yang hilang (mis. karena sisi pengirim memakai
+  // estimasi metadata yang meleset), beri tahu lewat status "⏳ menunggu…" dan
+  // biarkan buffer lama kedaluwarsa; pengirim akan mengirim ulang dengan msgId
+  // baru, dan penerima membuat buffer baru untuk msgId tersebut.
+  function collectPart(p, unixTime) {
+    const mid = p.mid;
+    const part = Number(p.part);
+    const total = Number(p.total);
+    if (!Number.isInteger(part) || !Number.isInteger(total) || total < 1 || part >= total) return;
+    let buf = state.pending.get(mid);
+    const expire = (b) => {
+      // hapus semua buffer yang tercatat bersamaan dengan ini, lalu beri tahu
+      // kalau ternyata ada potongan yang hilang (pengirim akan mengirim ulang
+      // dengan msgId baru, jadi kita tidak menampilkan pesan cacat)
+      let stale = false;
+      for (const [k, v] of [...state.pending]) {
+        if (v === b || (v.t && Math.abs(v.t - b.t) < 100)) {
+          stale = stale || v.count < v.parts.length;
+          clearTimeout(v.timer);
+          state.pending.delete(k);
+        }
+      }
+      if (stale) toast('Potongan pesan tidak lengkap — pengirim mengirim ulang…');
+      updatePendingLabel();
+    };
+    if (!buf) {
+      buf = { parts: new Array(total), count: 0, t: Date.now(), timer: null };
+      state.pending.set(mid, buf);
+      buf.timer = setTimeout(() => expire(buf), CHUNK_TTL);
+    } else if (total > buf.parts.length) {
+      // ternyata jumlah potongan lebih banyak dari perkiraan awal
+      buf.parts.length = total;
+    }
+    if (Date.now() - buf.t >= CHUNK_TTL) {
+      // sudah lewat masa berlaku -> sebagian isi mungkin terbuang; jalankan
+      // kedaluwarsa sekarang supaya status jujur & pengirim mengirim ulang
+      expire(buf);
+      return;
+    }
+    if (buf.parts[part] === undefined) {
+      buf.parts[part] = p.text;
+      buf.count++;
+    }
+    if (buf.count === buf.parts.length) {
+      clearTimeout(buf.timer);
+      state.pending.delete(mid);
+      addMessage({ text: buf.parts.join(''), from: p.from, cid: p.cid }, unixTime);
+    }
+    updatePendingLabel();
+  }
+
+  // Label kecil di bawah composer: ada pesan panjang yang masih menunggu
+  // potongan sisanya (atau terdeteksi tidak lengkap -> sedang dikirim ulang).
+  function updatePendingLabel() {
+    const el = $('#pendingCount');
+    if (!el) return;
+    const n = state.pending.size;
+    el.textContent = n ? `⏳ ${n} pesan panjang menunggu potongan…` : '';
+  }
 
   // ---------- util ----------
   const clientId = (() => {
@@ -83,7 +230,7 @@
     leaveRoom(true);
 
     const { topic, key } = await deriveKeys(code);
-    state = { code, topic, key, es: null, seen: new Set() };
+    state = { code, topic, key, es: null, seen: new Set(), pending: new Map() };
 
     $('#roomCode').textContent = code;
     messagesEl.innerHTML = '<div class="empty">Belum ada pesan. Kirim yang pertama!</div>';
@@ -106,14 +253,18 @@
         if (m.event !== 'message' || state.seen.has(m.id)) return;
         state.seen.add(m.id);
         const payload = await decrypt(m.message);
-        addMessage(payload, m.time);
+        if (typeof payload.mid === 'string' && Number.isInteger(payload.part)) {
+          collectPart(payload, m.time); // bagian dari pesan panjang -> tunggu lengkap
+        } else {
+          addMessage(payload, m.time);
+        }
       } catch (_) { /* bukan pesan valid / kunci salah -> abaikan */ }
     };
   }
 
   function leaveRoom(silent) {
     if (state.es) state.es.close();
-    state = { code: null, topic: null, key: null, es: null, seen: new Set() };
+    state = { code: null, topic: null, key: null, es: null, seen: new Set(), pending: new Map() };
     if (!silent) {
       room.classList.add('hidden');
       home.classList.remove('hidden');
@@ -163,24 +314,65 @@
   }
 
   // ---------- kirim ----------
+  let sending = false;
+
+  // Jika server menolak payload (mis. karena estimasi metadata meleset),
+  // perkecil potongan lalu potong ulang & kirim dari awal dengan msgId baru —
+  // penerima membuang buffer lama dan menunggu versi baru yang utuh. Maks 3x.
+  async function sendWithRetry(text, from) {
+    let metaBytes = 256 + clientId.length + from.length;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const parts = await buildParts(text, from, metaBytes);
+        if (parts.length === 1) {
+          // pesan pendek: kirim sekali saja tanpa metadata chunk (hemat kuota)
+          const body = await encrypt({ text, from, cid: clientId });
+          if (!(await postChunk(body))) throw new Error('over');
+        } else {
+          await sendMessageChunks(parts, from, crypto.randomUUID(), parts.length);
+        }
+        return parts.length;
+      } catch (e) {
+        if (e.message !== 'over' || attempt >= 3) throw e;
+        metaBytes = Math.min(metaBytes * 2, 8192);
+        await new Promise((r) => setTimeout(r, 400));
+      }
+    }
+  }
+
   async function send() {
     const text = textInput.value.trim();
-    if (!text || !state.topic) return;
-    const body = await encrypt({ text, from: nameInput.value.trim() || 'Anonim', cid: clientId });
-    if (body.length > MAX_BODY) { toast('Teks terlalu panjang (maks ± 2.500 karakter)'); return; }
+    if (!text || !state.topic || sending) return;
+    const from = nameInput.value.trim() || 'Anonim';
+    sending = true;
+    $('#sendBtn').disabled = true;
     try {
-      const res = await fetch(`${SERVER}/${state.topic}`, { method: 'POST', body });
-      if (!res.ok) throw new Error(res.status);
+      const n = await sendWithRetry(text, from);
       textInput.value = '';
       autosize();
+      updateCounter();
+      if (n > 1) toast(`Terkirim dalam ${n} potongan`);
     } catch (e) {
-      toast('Gagal kirim, cek koneksi');
+      toast(e.message === 'over'
+        ? 'Terlalu panjang untuk relay — coba kurangi teks atau perpendek nama.'
+        : 'Gagal kirim, cek koneksi');
+    } finally {
+      sending = false;
+      $('#sendBtn').disabled = false;
     }
   }
 
   function autosize() {
     textInput.style.height = 'auto';
-    textInput.style.height = Math.min(textInput.scrollHeight, 140) + 'px';
+    textInput.style.height = Math.min(textInput.scrollHeight, 260) + 'px';
+  }
+
+  // penghitung karakter realtime (muncul saat melewati ambang bawah)
+  const counterEl = $('#charCount');
+  function updateCounter() {
+    const n = textInput.value.trim().length;
+    if (n < SOFT_WARN_CHARS) { counterEl.textContent = ''; return; }
+    counterEl.textContent = `${n.toLocaleString('id-ID')} karakter`;
   }
 
   // ---------- event ----------
@@ -192,7 +384,7 @@
     navigator.clipboard.writeText(url).then(() => toast('Link room tersalin'));
   };
   $('#sendForm').onsubmit = (e) => { e.preventDefault(); send(); };
-  textInput.addEventListener('input', autosize);
+  textInput.addEventListener('input', () => { autosize(); updateCounter(); });
   textInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
   });

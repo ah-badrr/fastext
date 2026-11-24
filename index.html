@@ -24,7 +24,7 @@
       <button type="submit">Masuk</button>
     </form>
 
-    <p class="hint">Pesan dienkripsi di browser (AES-GCM) dengan kode room sebagai kuncinya. Makin acak kodenya, makin aman. Pesan tersimpan sementara di server relay (±12 jam).</p>
+    <p class="hint">Pesan dienkripsi di browser (AES-GCM) dengan kode room sebagai kuncinya. Makin acak kodenya, makin aman. Pesan tersimpan sementara di server relay (±12 jam). Teks panjang otomatis dipecah menjadi beberapa potongan dan digabung lagi di sisi penerima — praktis tidak ada batas jumlah karakter.</p>
   </main>
 
   <!-- Halaman room -->
@@ -46,6 +46,8 @@
       <textarea id="textInput" rows="1" placeholder="Ketik teks... (Enter kirim, Shift+Enter baris baru)"></textarea>
       <button id="sendBtn" class="primary" type="submit">Kirim</button>
     </form>
+    <div id="charCount" class="char-count"></div>
+    <div id="pendingCount" class="char-count"></div>
   </main>
 
   <div id="toast" class="toast"></div>

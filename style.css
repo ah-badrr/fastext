@@ -105,8 +105,10 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 
 .msg .body a { color: var(--accent); }
 .msg .copy { margin-left: auto; padding: 1px 8px; font-size: .72rem; border-radius: 6px; }
 
-.composer { display: flex; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--border); align-items: flex-end; }
+.composer { display: flex; gap: 8px; padding: 10px 14px 2px; border-top: 1px solid var(--border); align-items: flex-end; }
 .composer textarea { resize: none; max-height: 140px; }
+.char-count { min-height: 18px; font-size: .72rem; color: var(--muted); text-align: right; padding: 0 16px 6px; }
+.char-count.warn { color: #ef4444; font-weight: 600; }
 
 .toast {
   position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
